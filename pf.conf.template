@@ -1,0 +1,42 @@
+# Tabelki
+
+ssh_wesola =    "{ 95.130.5.224/29, 185.186.154.24/29 }"
+ssh_atman =     "{ 213.189.47.192/28, 85.232.240.0/24, 77.79.194.192/29 }"
+ssh_rimco =     "{ 193.16.240.0/24 }"
+ssh_hector =    "{ 217.17.37.0/24 }"
+ssh_epix =      "{ 94.246.173.176/28 }"
+
+table <sshsafe> { $ssh_wesola, $ssh_rimco, $ssh_atman, $ssh_hector, $ssh_epix }
+table <sshsafev6> { 2001:470:d067::/48, 2001:470:61B0::/48, \
+                    2001:1a68:2c::/48, 2001:470:51E1::/48, 2001:470:6C:13F::/64 }
+
+tarpit_ports = "{ 22 25 80 143 443 465 993 }"
+
+# Redirects to tarpit
+
+rdr pass on $ext_if inet proto tcp from !<sshsafe> to any port 22 -> 127.0.0.1 port 2222
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 22 -> ::1 port 2222
+rdr pass on $ext_if proto tcp from !<sshsafe> to any port 25 -> 127.0.0.1 port 2525
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 25 -> ::1 port 2525
+rdr pass on $ext_if proto tcp from !<sshsafe> to any port 80 -> 127.0.0.1 port 8080
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 80 -> ::1 port 8080
+rdr pass on $ext_if proto tcp from !<sshsafe> to any port 143 -> 127.0.0.1 port 1143
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 143 -> ::1 port 1143
+rdr pass on $ext_if proto tcp from !<sshsafe> to any port 443 -> 127.0.0.1 port 8443
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 443 -> ::1 port 8443
+rdr pass on $ext_if proto tcp from !<sshsafe> to any port 465 -> 127.0.0.1 port 4465
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 465 -> ::1 port 4465
+rdr pass on $ext_if proto tcp from !<sshsafe> to any port 993 -> 127.0.0.1 port 9993
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 993 -> ::1 port 9993
+
+# Pass in traffic to tarpit
+
+# internet -> server
+
+pass in quick on $ext_if inet  proto tcp from <sshsafe>   to ($ext_if) port 22 \
+    flags S/SA modulate state
+pass in quick on $ext_if inet6 proto tcp from <sshsafev6> to ($ext_if) port 22 \
+    flags S/SA modulate state
+
+pass in quick on $ext_if proto tcp from any to any port $tarpit_ports flags S/SA keep state
+

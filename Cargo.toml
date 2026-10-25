@@ -1,0 +1,43 @@
+[package]
+name    = "tarpit"
+version = "0.14.0"
+edition = "2021"
+description = "Universal multi-protocol network tarpit daemon"
+
+[[bin]]
+name = "tarpit"
+path = "src/main.rs"
+
+[dependencies]
+tokio       = { version = "1", features = ["full"] }
+
+# TLS - pin BOTH rustls and tokio-rustls to ring only.
+# tokio-rustls 0.26 defaults to aws-lc-rs; if we don't override that,
+# Cargo unions the features and compiles both providers.  With both
+# providers compiled, ServerConfig::builder() panics because rustls
+# cannot choose a default provider automatically.
+tokio-rustls   = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls         = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+
+serde     = { version = "1", features = ["derive"] }
+toml      = "0.8"
+clap      = { version = "4", features = ["derive"] }
+libc      = "0.2"   # kept for SO_KEEPALIVE setsockopt and ENOBUFS check in service.rs
+daemonize = "0.5"
+rand      = "0.8"
+anyhow    = "1"
+
+# Syslog: we use the `syslog` crate (https://lib.rs/crates/syslog) instead of
+# calling libc::openlog/syslog directly.  The crate gives us:
+#   - no unsafe code in slog.rs
+#   - type-safe Facility / Severity enums
+#   - proper Result types so we can detect a dead syslogd socket
+# We pin to 6.x which is the most widely-deployed stable line as of 2025.
+syslog = "6"
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+strip         = true

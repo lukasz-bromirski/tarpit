@@ -1,0 +1,322 @@
+# tarpit.toml - universal network tarpit configuration (FreeBSD)
+#
+# Quick-start:
+#   1. sudo mkdir -p /usr/local/etc/tarpit
+#   2. sudo cp tarpit.toml /usr/local/etc/tarpit/tarpit.toml
+#   3. Configure pf redirection (see pf.conf.example)
+#   4. service tarpit start
+
+# ---------------------------------------------------------------------------
+# [daemon]
+# ---------------------------------------------------------------------------
+[daemon]
+pid_file    = "/var/run/tarpit.pid"
+working_dir = "/var/tmp"            # /var/tmp survives reboot; /tmp may not
+
+# ---------------------------------------------------------------------------
+# [syslog]
+# ---------------------------------------------------------------------------
+[syslog]
+facility = "daemon"
+level    = "info"
+ident    = "tarpit"
+
+# ---------------------------------------------------------------------------
+# [stats]  - periodic syslog reporter
+# ---------------------------------------------------------------------------
+[stats]
+# How often to emit a summary line to syslog (seconds).
+# The report shows total seconds wasted, current active sessions, and
+# peak (maximum simultaneous) connections per service since last restart.
+# Set to 0 to disable reporting entirely.
+#
+# Example output (every 3600 s):
+#   tarpit report - 482 seconds wasted, 16 tarpit session(s) right now,
+#   maximums per each configured service: ssh (4), smtps (28), http (3)
+interval_secs = 3600
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+
+# ── SSH ─────────────────────────────────────────────────────────────────────
+# pf: rdr port 22 → 2222 (see pf.conf.example)
+# bind_addrs controls which local addresses each service listens on.
+# Default (if omitted): ["127.0.0.1"]  - IPv4 loopback only.
+#
+# Dual-stack (IPv4 + IPv6 loopback):
+#   bind_addrs = ["127.0.0.1", "::1"]
+#
+# One listener is spawned per address; max_connections is shared across both,
+# so the cap applies to the service as a whole, not per address family.
+#
+# Remember to add matching pf rdr rules for ::1 as well as 127.0.0.1
+# when using IPv6 (see pf.conf.example).
+
+[[service]]
+name                    = "ssh"
+bind_addrs              = ["127.0.0.1", "::1"]
+bind_port               = 2222
+max_connections         = 4096
+connection_timeout_secs = 604800
+
+# tarpit_mode - one of:
+#
+#   "lines"        Endlessh-style: drip random pre-banner lines forever.
+#                  Holds idle-timeout scanners indefinitely; loses hard-
+#                  total-timeout scanners (libssh2/Paramiko defaults) at
+#                  their ~10 s ceiling.
+#                  Uses: first_tick_ms, tick_ms, jitter_ms, line_min/max_len
+#
+#   "ssh_kex"      Send a realistic OpenSSH version banner once, then go
+#                  silent.  The scanner exits the banner phase and enters
+#                  the SSH KEX state machine, which has a MUCH longer
+#                  timeout (30 s - 10 min in libssh2 / Paramiko / OpenSSH
+#                  client defaults).  Holds the hard-timeout cohort that
+#                  "lines" cannot.
+#                  Uses: first_tick_ms, ssh_banner
+#
+#   "ssh_adaptive" Per-IP adaptive: starts every new source on ssh_kex.
+#                  Tracks each source IP's recent disconnect pattern in
+#                  an in-memory cache.  When an IP has racked up 3+ short
+#                  io_error disconnects (8-13 s window) within its
+#                  rolling history, subsequent connections from THAT IP
+#                  switch to "lines" mode instead.  The theory: some
+#                  scanner cohorts have a longer banner-phase timeout
+#                  than KEX-phase timeout, and never sending a banner
+#                  keeps them in the more lenient phase longer.
+#
+#                  Honest caveat: scanners with a HARD 10 s total-connect
+#                  timeout (no per-phase distinction) produce the same
+#                  ~10 s with either sub-mode.  Adaptive helps only when
+#                  the two phases have genuinely different ceilings.
+#                  Watch logs for the same IP across many sessions to see
+#                  if duration improves after the mode switch.
+#                  Uses: ssh_banner + ALL lines-mode fields (you must
+#                  set them too because the fallback uses them).
+#
+# Pick "ssh_kex" if your logs show heavy 10 s clustering and you want a
+# deterministic answer.  Pick "ssh_adaptive" to let the daemon experiment
+# on a per-IP basis.  Pick "lines" for maximum chaos per session.
+tarpit_mode   = "ssh_adaptive"
+
+# Banner for ssh_kex mode.  MUST start with "SSH-" (RFC 4253 §4.2).
+# Do NOT include a trailing \r\n - the daemon appends it.
+# install.sh randomises the OpenSSH version (8.0 - 10.0) at install time, so
+# your per-host fingerprint differs from any other tarpit deployment.
+ssh_banner = "SSH-2.0-OpenSSH_9.7"
+
+# ── Timing ──────────────────────────────────────────────────────────────────
+#
+# All of the fields below are USED by ssh_adaptive (since it falls back to
+# lines mode for some IPs).  If you switch to plain ssh_kex, the tick_ms /
+# jitter_ms / line_*_len fields are ignored but harmless to keep.
+#
+#   first_tick_ms = 100   - send first byte ASAP.  Some aggressive scanners
+#                           have a "first byte" deadline as low as 200-300 ms.
+#                           100 ms beats them all without looking suspicious
+#                           (real sshd takes 5-50 ms to send its banner).
+#
+#   tick_ms       = 4000  - send a line every 4-6 s (with jitter) in lines /
+#                           ssh_adaptive-fallback mode.  Most SSH scanners
+#                           that use an IDLE timeout set it in the 6-15 s
+#                           range; staying well under 6 s keeps them
+#                           connected indefinitely.
+#
+#   jitter_ms     = 2000  - actual range 4-6 s.  Defeats timing fingerprinting
+#                           without crossing the 6 s safety ceiling.
+first_tick_ms = 100
+tick_ms       = 4000
+jitter_ms     = 2000
+
+# Used by lines mode and ssh_adaptive's lines fallback; ignored by plain ssh_kex.
+line_min_len  = 16
+line_max_len  = 64       # endlessh default is 32; wider variety per line
+                         # makes pattern-matching detection slightly harder
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
+# pf: rdr port 80 → 8080
+#
+# tarpit_mode = "http_drip":
+#   Acts like a slow HTTP/1.1 server.  Reads the request, drips a plausible
+#   status line and ~10 randomised response headers byte-by-byte, then opens
+#   a chunked-encoded HTML body and streams <head> / <body> elements with
+#   random-but-realistic content forever.  Never sends the terminating chunk,
+#   so the client hangs waiting for "more body" until its read timeout fires
+#   or connection_timeout_secs expires here.
+#
+#   hostname:           used in the Server header signature
+#                       "Apache/X.Y.Z (FreeBSD) Server at <hostname> Port 80"
+#                       install.sh substitutes "mail.example.com" at install time.
+#   first_tick_ms:      pause before status line (looks like server processing)
+#   tick_ms / jitter:   delay between header bytes / body chunks
+#   bytes_per_tick:     bytes per drip slice in the header section
+[[service]]
+name                    = "http"
+bind_addrs              = ["127.0.0.1", "::1"]
+bind_port               = 8080
+max_connections         = 8192
+connection_timeout_secs = 1800       # 30 min — let them hang properly
+
+tarpit_mode    = "http_drip"
+hostname       = "mail.example.com"  # install.sh substitutes
+first_tick_ms  = 200
+tick_ms        = 800                 # ~1.25 chunks/sec while streaming body
+jitter_ms      = 400
+bytes_per_tick = 2                   # 2 bytes per drip slice in status/headers
+
+# ── HTTPS ───────────────────────────────────────────────────────────────────
+# pf: rdr port 443 → 8443
+[[service]]
+name                    = "https"
+bind_addrs              = ["127.0.0.1", "::1"]
+bind_port               = 8443
+max_connections         = 8192
+connection_timeout_secs = 1800
+
+tarpit_mode    = "http_drip"
+hostname       = "mail.example.com"  # install.sh substitutes
+first_tick_ms  = 200
+tick_ms        = 800
+jitter_ms      = 400
+bytes_per_tick = 2
+
+# TLS: complete the handshake so bots see a "real" HTTPS server.
+# Generate self-signed cert:
+#   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+#     -keyout /usr/local/etc/tarpit/key.pem \
+#     -out    /usr/local/etc/tarpit/cert.pem \
+#     -days 3650 -nodes -subj '/CN=tarpit'
+[service.tls]
+cert_pem               = "/usr/local/etc/tarpit/cert.pem"
+key_pem                = "/usr/local/etc/tarpit/key.pem"
+handshake_timeout_secs = 10
+
+# ── SMTP ─────────────────────────────────────────────────────────────────────
+# pf: rdr port 25 → 2525
+#
+# tarpit_mode = "smtp_drip":
+#   Engages the SMTP command state machine like a real but VERY slow MTA,
+#   directly modelled on OpenBSD spamd(8) in blackholing mode.  The session
+#   flow:
+#
+#     1. Brief jittered pause (first_tick_ms) before saying anything.
+#     2. Multi-line 220 greeting: 5 lines by default, each line dripped
+#        byte-by-byte at bytes_per_tick / tick_ms, with a tick_ms pause
+#        BETWEEN lines.  This is where the bulk of the per-session time
+#        comes from - at 1 byte/sec, ~5 lines x ~50 chars ~ 4-5 minutes
+#        burned before the spammer can even send EHLO.
+#     3. EHLO triggers an 11-line capability response, also dripped.
+#     4. MAIL FROM / RCPT TO / DATA all engage normally, each response
+#        also dripped, with a random tick_ms..3 x tick_ms pause
+#        before each response begins.
+#     5. After DATA we drain the body, wait 30-90 s more, then return
+#        421 ("try again later") - forcing the sender's MTA to keep the
+#        message queued and retry for days, every retry walking back
+#        into the same tarpit.  We NEVER return 250 OK after DATA, so
+#        nothing flows through and this can't be abused as an open relay.
+#
+# Config fields used by smtp_drip:
+#
+#   hostname            Used in 220 banner, 250 EHLO response, 221 QUIT.
+#                       install.sh substitutes "mail.example.com" with the
+#                       actual system hostname at install time.
+#
+#   smtp_banner_lines   How many lines in the multi-line 220 greeting.
+#                       1..=20.  Default 5 (matches spamd's -c default).
+#                       Set to 1 for a single-line greeting (legacy v0.12
+#                       behaviour).  Higher = longer session time, but
+#                       diminishing returns past ~8 because most spammers
+#                       give up by then.
+#
+#   first_tick_ms       Initial pause before sending the banner.
+#                       spamd-style default: 5000 ms.  Lower if you want
+#                       the connection to feel slightly more responsive
+#                       (looks less like a tarpit) at the cost of one-shot
+#                       hold time.
+#
+#   tick_ms             Inter-byte drip cadence AND inter-line pause in
+#                       the multi-line banner AND teergrube delay before
+#                       command responses ( x  1..3 random).  1000 ms = the
+#                       spamd "1 byte per second" stutter mode.
+#
+#   bytes_per_tick      How many bytes to emit per tick.  1 = full spamd
+#                       byte-by-byte mode.  Higher numbers loosen the
+#                       drip - useful only if your bandwidth budget is
+#                       tight; for a tarpit there's no benefit.
+#
+# Open this on the real port 25 (via pf rdr) to slow ANY spam scanner
+# that probes you.  No login, no relay, no risk — just a black hole
+# shaped like Postfix.
+
+[[service]]
+name                    = "smtp"
+bind_addrs              = ["127.0.0.1", "::1"]
+bind_port               = 2525
+max_connections         = 2048
+connection_timeout_secs = 604800
+
+tarpit_mode       = "smtp_drip"
+hostname          = "mail.example.com"  # install.sh substitutes
+smtp_banner_lines = 7                # spamd default
+first_tick_ms     = 5000             # 5 s initial pause
+tick_ms           = 1000             # 1 byte / 1 s (spamd "stutter 1" default)
+bytes_per_tick    = 1                # full byte-by-byte mode
+
+# ── SMTPS ───────────────────────────────────────────────────────────────────
+# pf: rdr port 465 → 4465
+[[service]]
+name                    = "smtps"
+bind_addrs              = ["127.0.0.1", "::1"]
+bind_port               = 4465
+max_connections         = 1024
+connection_timeout_secs = 604800
+
+tarpit_mode       = "smtp_drip"
+hostname          = "mail.example.com"  # install.sh substitutes
+smtp_banner_lines = 5
+first_tick_ms     = 5000
+tick_ms           = 1000
+bytes_per_tick    = 1
+
+[service.tls]
+cert_pem               = "/usr/local/etc/tarpit/cert.pem"
+key_pem                = "/usr/local/etc/tarpit/key.pem"
+handshake_timeout_secs = 10
+
+# ── IMAP ────────────────────────────────────────────────────────────────────
+# pf: rdr port 143 → 1143
+[[service]]
+name                    = "imap"
+bind_addrs              = ["127.0.0.1", "::1"]
+bind_port               = 1143
+max_connections         = 1024
+connection_timeout_secs = 1800
+
+tarpit_mode    = "static"
+first_tick_ms  = 500      # server-speaks-first: drip first byte fast
+tick_ms        = 20000
+jitter_ms      = 10000
+static_data    = "* OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE AUTH=PLAIN AUTH=LOGIN] Dovecot ready.\r\n"
+bytes_per_tick = 1
+
+# ── IMAPS ───────────────────────────────────────────────────────────────────
+# pf: rdr port 993 → 9993
+[[service]]
+name                    = "imaps"
+bind_addrs              = ["127.0.0.1", "::1"]
+bind_port               = 9993
+max_connections         = 1024
+connection_timeout_secs = 1800
+
+tarpit_mode    = "static"
+first_tick_ms  = 500      # server-speaks-first: drip first byte fast
+tick_ms        = 20000
+jitter_ms      = 10000
+static_data    = "* OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE AUTH=PLAIN AUTH=LOGIN] Dovecot ready.\r\n"
+bytes_per_tick = 1
+
+[service.tls]
+cert_pem               = "/usr/local/etc/tarpit/cert.pem"
+key_pem                = "/usr/local/etc/tarpit/key.pem"
+handshake_timeout_secs = 10

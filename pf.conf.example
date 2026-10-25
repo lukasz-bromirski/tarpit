@@ -1,0 +1,105 @@
+# pf.conf.example - FreeBSD pf(4) port redirection rules for tarpit
+#
+# Compatibility: FreeBSD 13+ (pf version based on OpenBSD 6.x)
+#
+# This file shows ONLY the tarpit-relevant rules.  Merge into your existing
+# /etc/pf.conf; do not replace it wholesale unless you have no other rules.
+#
+# Activate:
+#   pfctl -n -f /etc/pf.conf        # dry-run / syntax check
+#   pfctl -f /etc/pf.conf           # load rules (pf must already be enabled)
+#
+# Enable pf permanently in /etc/rc.conf:
+#   pf_enable="YES"
+#   pflog_enable="YES"              # optional packet logging (see pflog0)
+#   pf_rules="/etc/pf.conf"
+#
+# Reload individual anchors without full rule reload:
+#   pfctl -a tarpit -f /etc/pf.anchors/tarpit
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Interface macros
+# ---------------------------------------------------------------------------
+# Set this to your external-facing interface.
+# Find it with: ifconfig | grep -E '^[a-z]' | grep -v lo
+ext_if = "vtnet0"       # typical KVM/Bhyve; adjust for igb0, em0, bce0, etc.
+
+# Tarpit listener address (loopback - tarpit only binds locally)
+tarpit_addr = "127.0.0.1"
+
+# ---------------------------------------------------------------------------
+# Bypass table
+# CRITICAL: add every IP from which you manage the real services.
+# Any IP NOT in this table will be redirected to the tarpit.
+# Add your workstation, jump host, monitoring probes, etc.
+# ---------------------------------------------------------------------------
+table <sshsafe> persist {
+    # 192.0.2.10          # ← example management workstation
+    # 192.0.2.0/28        # ← example management subnet
+}
+
+table <sshsafev6> persist {
+#	2001:db8::/32
+}
+
+# ---------------------------------------------------------------------------
+# Shorthand port group
+# ---------------------------------------------------------------------------
+tarpit_ports = "{ 22 25 80 143 443 465 993 }"
+
+# ---------------------------------------------------------------------------
+# rdr rules - redirect scanner traffic to the tarpit
+#
+# Rule evaluation order:
+#   1. rdr rules are evaluated before filter (pass/block) rules.
+#   2. The !<tarpit_bypass> negation ensures management IPs hit the real
+#      service and never reach the tarpit.
+#   3. 'rdr pass' creates an implicit pass rule so the redirected packet
+#      is not dropped by a later 'block in default'.
+# ---------------------------------------------------------------------------
+
+rdr pass on $ext_if inet proto tcp from !<sshsafe> to any port 22 -> 127.0.0.1 port 2222
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 22 -> ::1 port 2222
+rdr pass on $ext_if proto tcp from !<sshsafe> to any port 25 -> 127.0.0.1 port 2525
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 25 -> ::1 port 2525
+rdr pass on $ext_if proto tcp from !<sshsafe> to any port 80 -> 127.0.0.1 port 8080
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 80 -> ::1 port 8080
+rdr pass on $ext_if proto tcp from !<sshsafe> to any port 143 -> 127.0.0.1 port 1143
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 143 -> ::1 port 1143
+rdr pass on $ext_if proto tcp from !<sshsafe> to any port 443 -> 127.0.0.1 port 8443
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 443 -> ::1 port 8443
+rdr pass on $ext_if proto tcp from !<sshsafe> to any port 465 -> 127.0.0.1 port 4465
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 465 -> ::1 port 4465
+rdr pass on $ext_if proto tcp from !<sshsafe> to any port 993 -> 127.0.0.1 port 9993
+rdr pass on $ext_if inet6 proto tcp from !<sshsafev6> to any port 993 -> ::1 port 9993
+
+# ---------------------------------------------------------------------------
+# Minimal filter rules - extend to match your site policy
+# ---------------------------------------------------------------------------
+
+# Skip pf processing entirely on loopback (tarpit ↔ kernel communication)
+set skip on lo0
+
+# Pass all outbound traffic
+pass out quick keep state
+
+# Explicitly pass management traffic without redirection.
+# Because rdr rules fire first (above), this pass rule is mainly for clarity;
+# the !<tarpit_bypass> in the rdr rules already prevents redirection.
+pass in quick from <tarpit_bypass> keep state
+
+# Default: block unsolicited inbound (state table handles return traffic)
+block in default
+
+# ---------------------------------------------------------------------------
+# Verification commands
+# ---------------------------------------------------------------------------
+# Show active redirect rules:          pfctl -s nat
+# Show state table (active conns):     pfctl -s states | grep tarpit
+# Show bypass table contents:          pfctl -t tarpit_bypass -T show
+# Add an IP to bypass table at runtime (no reload needed):
+#   pfctl -t tarpit_bypass -T add 203.0.113.5
+# Remove an IP from bypass table:
+#   pfctl -t tarpit_bypass -T delete 203.0.113.5
+# ---------------------------------------------------------------------------
